@@ -21,6 +21,7 @@
                    background:#232838; color:#e6e8ee; font-size:14px; }
   button.go { background:#1f6feb; border-color:#1f6feb; font-weight:600; }
   button.stop { background:#3a2130; border-color:#5a2b3f; color:#ff8fae; }
+  button.reset { background:#2f2a1c; border-color:#5c4d24; color:#ffd166; }
   button:disabled { opacity:.45; }
   .stat { font-size:12px; color:#8b93a7; line-height:1.9; }
   .stat b { color:#e6e8ee; }
@@ -51,6 +52,7 @@
     </div>
     <div class="row"><button id="go" class="go">开始</button></div>
     <div class="row"><button id="stop" class="stop">停止</button></div>
+    <div class="row"><button id="reset" class="reset">复位到零位</button></div>
     <div class="row"><div class="score" id="score">0 : 0</div></div>
 
     <hr>
@@ -96,6 +98,7 @@ $('#go').onclick = async () => {
   poll();
 };
 $('#stop').onclick = async () => { await fetch('/api/stop', {method:'POST'}); poll(); };
+$('#reset').onclick = async () => { await fetch('/api/reset', {method:'POST'}); poll(); };
 
 // ---------- 手势小游戏 ----------
 let qOn = false, qScore = 0, qLeft = 30, qTarget = null, qTick = null, qTimer = null;

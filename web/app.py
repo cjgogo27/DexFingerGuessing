@@ -166,6 +166,7 @@ class Engine(threading.Thread):
         self.lm = landmarker
         self.hand = None
         self.busy = False
+        self.enabled = False
         self.lo = {n: None for n in FINGER_ORDER}
         self.hi = {n: None for n in FINGER_ORDER}
         self.smooth = {n: 0.0 for n in FINGER_ORDER}
@@ -211,6 +212,7 @@ class Engine(threading.Thread):
             if self.hand:
                 self.hand.enable()
                 self.hand.move_to([0] * 13, duration=0.6)
+                self.enabled = True
             with LOCK:
                 STATE["active"] = True
                 STATE["mode"] = mode
@@ -225,12 +227,30 @@ class Engine(threading.Thread):
                 try:
                     self.hand.move_to([0] * 13, duration=0.6)
                     self.hand.disable()
+                    self.enabled = False
                 except Exception:
                     pass
             with LOCK:
                 STATE["active"] = False
                 STATE["mode"] = "preview"
                 STATE["last"] = "已停止"
+        self._do(go)
+
+    def reset_pose(self):
+        """复位：停掉当前玩法，13 个关节回零位，并保持使能。"""
+        def go():
+            with LOCK:
+                STATE["active"] = False
+                STATE["mode"] = "preview"
+                STATE["last"] = ""
+                STATE["score"] = {"me": 0, "bot": 0, "draw": 0}
+            if self.hand:
+                if not self.enabled:
+                    self.hand.enable()
+                    self.enabled = True
+                self.hand.move_to([0] * 13, duration=1.5)
+            with LOCK:
+                STATE["message"] = "已复位到零位"
         self._do(go)
 
     def send(self, target):
@@ -396,6 +416,15 @@ def api_start():
 def api_stop():
     if ENG:
         ENG.stop_mode()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    """复位：回到零位。"""
+    if not ENG:
+        return jsonify({"ok": False, "error": "engine not running"}), 503
+    ENG.reset_pose()
     return jsonify({"ok": True})
 
 
