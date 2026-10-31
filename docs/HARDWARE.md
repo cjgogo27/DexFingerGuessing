@@ -65,3 +65,55 @@
 | 设备节点 | `/dev/ttyUSB0` |
 | 用户组 | 需要 `dialout`（`sudo usermod -aG dialout $USER`） |
 | Windows | COM8，需安装 PL2303 驱动 |
+
+## 7. 摄像头「能枚举但不出帧」
+
+典型症状：
+
+- `lsusb` 看得到设备，`/dev/video0` 也在
+- OpenCV 读帧一直 `select() timeout`
+- `dmesg` 刷 `uvcvideo ...: Failed to set UVC probe control : -71`（-71 = EPROTO）
+
+这不是驱动没装，是 **UVC 控制传输失败**，常见于 USB 自动挂起和供电/线材问题。
+
+### 处理顺序
+
+**① 关闭 USB 自动挂起（最有效，建议做成永久规则）**
+
+```bash
+# 临时
+sudo sh -c 'echo on > /sys/bus/usb/devices/1-8/power/control'
+
+# 永久（按 VID 匹配，插拔后依然生效）
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="1bcf", ATTR{power/control}="on"' \
+  | sudo tee /etc/udev/rules.d/99-uvc-no-autosuspend.rules
+sudo udevadm control --reload-rules
+```
+
+**② 复位设备**
+
+```bash
+sudo bash scripts/recover_camera.sh
+```
+
+脚本会关自动挂起 → 把 `authorized` 置 0 再置 1 重新枚举 → 试抓 3 帧验证。
+
+**③ 换 USB 口**
+
+优先主板后置口，**不要和 485 转接头共用 USB hub**。
+这颗 SPCA2650 在共享 hub 上反复掉线，内核日志里出现过
+`Cannot enable. Maybe the USB cable is bad?`。
+
+**④ 换线 / 换摄像头**
+
+如果在多个口、多次复位后仍然 0 帧，基本可判定线材或摄像头本体问题。
+
+### 实在救不回来时的替代方案
+
+- **手机当摄像头**：装 IP Webcam 一类的 App，推 RTSP/HTTP 流，
+  把 `DEXH13_CAM` 换成流地址，可完全绕开 USB。
+- **掌心相机**：DexH13 自带 4K UVC 掌心相机（USB-A 输出），
+  接上就是另一路视频源。
+
+> 本项目已在 `web/app.py` 里做了兜底：摄像头打不开时服务照常启动，
+> 页面显示 `NO HAND`；设备恢复后视频会自动接上，不用重启。

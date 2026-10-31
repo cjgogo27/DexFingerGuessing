@@ -114,43 +114,41 @@ def draw(frame, lm, w, h, ratios, spans):
 class Camera:
     def __init__(self, idx=0, w=640, h=480):
         self.idx, self.w, self.h = idx, w, h
-        self.cap = self._open()
+        self.fmt = "MJPG"
+        self.cap = self._open(self.fmt)
         self.frame = None
         self.ts = 0.0
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def _open(self):
-        """打开摄像头。先试 MJPG（省带宽），不行退回驱动默认格式。
+    def _open(self, fourcc="MJPG"):
+        """打开摄像头（不阻塞：不在构造时探测首帧）。
 
         便宜的 UVC 摄像头在反复开关后经常只剩默认格式能用，
-        不做回退会表现为 select() timeout。
+        所以格式在重连时轮流尝试：MJPG <-> 驱动默认。
         """
-        for fourcc in ("MJPG", None):
-            c = cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
-            if not c.isOpened():
-                c.release()
-                continue
-            if fourcc:
-                c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-            c.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
-            c.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
-            ok, _ = c.read()
-            if ok:
-                return c
-            c.release()
-        return cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
+        c = cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
+        if fourcc:
+            c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        c.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
+        return c
 
     def _loop(self):
+        fails = 0
         while True:
             ok, f = self.cap.read()
             if not ok:
-                # 摄像头被拔出/复位时自动重开，别让整个服务死掉
-                time.sleep(0.3)
+                # 摄像头被拔出/复位时自动重开；失败次数越多等得越久，
+                # 避免高频重试把 UVC 打成 EPROTO
+                fails += 1
+                time.sleep(min(0.3 * (2 ** min(fails, 4)), 5.0))
                 if not self.cap.isOpened():
                     self.cap.release()
-                    self.cap = self._open()
+                    self.fmt = None if self.fmt == "MJPG" else "MJPG"
+                    self.cap = self._open(self.fmt)
                 continue
+            fails = 0
             with self.lock:
                 self.frame = f
                 self.ts = time.time()
@@ -417,7 +415,7 @@ def main():
             min_hand_detection_confidence=0.5, min_tracking_confidence=0.5))
 
     cam = Camera(int(os.environ.get("DEXH13_CAM", "0")))
-    for _ in range(24):                       # 最多等 12 秒
+    for _ in range(6):                        # 最多等 3 秒，没画面也照常起服务
         if cam.get()[0] is not None:
             break
         time.sleep(0.5)
