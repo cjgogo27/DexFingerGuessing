@@ -1,4 +1,5 @@
-pyserial>=3.4
-opencv-python>=4.5
-mediapipe>=0.10
-flask>=2.2
+# 依赖。注意 cv2 由 mediapipe 自带的 opencv-contrib-python 提供，
+# 也可以改用系统包（Ubuntu: apt install python3-opencv）。
+pyserial>=3.5
+mediapipe>=1.2,<2.0
+flask>=3.0

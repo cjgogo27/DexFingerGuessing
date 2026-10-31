@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DexPlay · 灵巧手控制台</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#12141a; color:#e6e8ee; transition: background .15s;
+         font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  body.flash { background:#17351f; }
+  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; }
+  .view { flex:1; min-width:0; }
+  .view img { width:100%; border-radius:10px; background:#000; display:block; }
+  .panel { width:340px; background:#1a1d26; border-radius:12px; padding:16px; }
+  h1 { font-size:17px; margin:0 0 4px; font-weight:600; }
+  .sub { font-size:12px; color:#6b7280; margin-bottom:14px; }
+  .row { margin-bottom:12px; }
+  label { display:block; font-size:12px; color:#8b93a7; margin-bottom:6px; }
+  select, button { width:100%; padding:10px; border-radius:8px; border:1px solid #2b3142;
+                   background:#232838; color:#e6e8ee; font-size:14px; }
+  button.go { background:#1f6feb; border-color:#1f6feb; font-weight:600; }
+  button.stop { background:#3a2130; border-color:#5a2b3f; color:#ff8fae; }
+  button:disabled { opacity:.45; }
+  .stat { font-size:12px; color:#8b93a7; line-height:1.9; }
+  .stat b { color:#e6e8ee; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .score { font-size:22px; font-weight:700; text-align:center; padding:6px 0; }
+  hr { border:0; border-top:1px solid #262b38; margin:14px 0; }
+  .quiz { background:#151823; border-radius:10px; padding:12px; }
+  .qhead { display:flex; justify-content:space-between; font-size:12px; color:#8b93a7; }
+  .target { font-size:30px; font-weight:700; text-align:center; padding:8px 0; color:#ffd166; }
+  .now { font-size:13px; text-align:center; color:#8b93a7; padding-bottom:6px; }
+  .now b { color:#31c48d; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="view"><img id="v" src="/stream" alt="实时画面"></div>
+  <div class="panel">
+    <h1>DexPlay</h1>
+    <div class="sub">PaXini DexH13 · 灵巧手互动游乐场</div>
+
+    <div class="row">
+      <label>玩法</label>
+      <select id="mode">
+        <option value="preview">预览（只看不动）</option>
+        <option value="mimic">跟随模仿</option>
+        <option value="rps">猜拳</option>
+      </select>
+    </div>
+    <div class="row"><button id="go" class="go">开始</button></div>
+    <div class="row"><button id="stop" class="stop">停止</button></div>
+    <div class="row"><div class="score" id="score">0 : 0</div></div>
+
+    <hr>
+
+    <div class="quiz">
+      <div class="qhead"><span>手势挑战（无需灵巧手）</span><span id="qt">30s</span></div>
+      <div class="target" id="tgt">—</div>
+      <div class="now">你出的：<b id="cur">—</b> · 得分 <b id="qs">0</b></div>
+      <button id="qstart" class="go" style="margin-top:8px">开始挑战</button>
+    </div>
+
+    <hr>
+    <div class="stat" id="st">连接中…</div>
+  </div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const ZH = {rock:'石头', paper:'布', scissors:'剪刀'};
+const HANDS = ['rock','paper','scissors'];
+
+// ---------- 状态轮询 ----------
+async function poll(){
+  try{
+    const s = await (await fetch('/api/status')).json();
+    const hd = s.hand ? '#31c48d' : '#f05252';
+    $('#st').innerHTML =
+      '<div><span class="dot" style="background:'+hd+'"></span>手：<b>'+(s.hand?'已检测':'未检测')+'</b></div>' +
+      '<div>手势：<b>'+(s.gesture?ZH[s.gesture]:'-')+'</b></div>' +
+      '<div>帧率：<b>'+s.fps+'</b> FPS</div>' +
+      '<div>状态：<b>'+(s.active?'运行中':'待机')+'</b> / '+s.mode+'</div>' +
+      '<div>灵巧手：<b>'+(s.hand_ok?'在线':'离线')+'</b></div>' +
+      '<div style="margin-top:6px;color:#6b7280">'+(s.message||'')+'</div>';
+    $('#score').textContent = s.score.me + ' : ' + s.score.bot + '  (平 ' + s.score.draw + ')';
+    $('#go').disabled = s.active;
+    $('#stop').disabled = !s.active;
+  }catch(e){ $('#st').textContent = '连接断开'; }
+}
+setInterval(poll, 500); poll();
+
+$('#go').onclick = async () => {
+  await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
+                             body: JSON.stringify({mode: $('#mode').value})});
+  poll();
+};
+$('#stop').onclick = async () => { await fetch('/api/stop', {method:'POST'}); poll(); };
+
+// ---------- 手势小游戏 ----------
+let qOn = false, qScore = 0, qLeft = 30, qTarget = null, qTick = null, qTimer = null;
+
+function newTarget(){
+  qTarget = HANDS[Math.floor(Math.random()*3)];
+  $('#tgt').textContent = ZH[qTarget];
+}
+
+async function tick(){
+  if(!qOn) return;
+  try{
+    const s = await (await fetch('/api/quick')).json();
+    $('#cur').textContent = s.gesture ? ZH[s.gesture] : '—';
+    if(s.gesture && s.gesture === qTarget){
+      qScore++; $('#qs').textContent = qScore;
+      document.body.classList.add('flash');
+      setTimeout(()=>document.body.classList.remove('flash'), 180);
+      newTarget();
+      await new Promise(r=>setTimeout(r, 500));   // 防止连加
+    }
+  }catch(e){}
+  if(qOn) setTimeout(tick, 90);
+}
+
+$('#qstart').onclick = () => {
+  if(qOn) return;
+  qOn = true; qScore = 0; qLeft = 30;
+  $('#qs').textContent = 0; $('#qt').textContent = '30s';
+  $('#qstart').disabled = true; $('#qstart').textContent = '挑战中…';
+  newTarget(); tick();
+  qTimer = setInterval(()=>{
+    qLeft--; $('#qt').textContent = qLeft + 's';
+    if(qLeft <= 0){
+      qOn = false; clearInterval(qTimer);
+      $('#qstart').disabled = false; $('#qstart').textContent = '再来一次';
+      $('#tgt').textContent = '得分 ' + qScore;
+    }
+  }, 1000);
+};
+</script>
+</body>
+</html>

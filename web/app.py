@@ -26,7 +26,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
 from dexh13 import DexH13, gestures          # noqa: E402
 
-from flask import Flask, Response, jsonify, request   # noqa: E402
+from flask import Flask, Response, jsonify, render_template, request   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ.get("DEXH13_HAND_MODEL") or os.path.join(
@@ -323,92 +323,9 @@ class Engine(threading.Thread):
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
-PAGE = """<!doctype html>
-<html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DexH13 控制台</title>
-<style>
-  * { box-sizing: border-box; }
-  body { margin:0; background:#12141a; color:#e6e8ee;
-         font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
-  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; }
-  .view { flex:1; min-width:0; }
-  .view img { width:100%; border-radius:10px; background:#000; display:block; }
-  .panel { width:320px; background:#1a1d26; border-radius:12px; padding:18px; }
-  h1 { font-size:17px; margin:0 0 16px; font-weight:600; letter-spacing:.5px; }
-  .row { margin-bottom:14px; }
-  label { display:block; font-size:12px; color:#8b93a7; margin-bottom:6px; }
-  select, button { width:100%; padding:10px; border-radius:8px; border:1px solid #2b3142;
-                   background:#232838; color:#e6e8ee; font-size:14px; }
-  button.go { background:#1f6feb; border-color:#1f6feb; font-weight:600; }
-  button.stop { background:#3a2130; border-color:#5a2b3f; color:#ff8fae; }
-  button:disabled { opacity:.45; }
-  .stat { font-size:12px; color:#8b93a7; line-height:1.9; }
-  .stat b { color:#e6e8ee; font-weight:600; }
-  .score { font-size:26px; font-weight:700; letter-spacing:2px; text-align:center;
-           padding:10px 0; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
-</style></head>
-<body>
-<div class="wrap">
-  <div class="view"><img id="v" src="/stream"></div>
-  <div class="panel">
-    <h1>DexH13 控制台</h1>
-    <div class="row">
-      <label>玩法</label>
-      <select id="mode">
-        <option value="preview">预览（只看不动）</option>
-        <option value="mimic">跟随模仿</option>
-        <option value="rps">猜拳</option>
-      </select>
-    </div>
-    <div class="row">
-      <button id="go" class="go">开始</button>
-    </div>
-    <div class="row">
-      <button id="stop" class="stop">停止</button>
-    </div>
-    <div class="row">
-      <label>比分（猜拳）</label>
-      <div class="score" id="score">0 : 0</div>
-    </div>
-    <div class="stat" id="st">连接中…</div>
-  </div>
-</div>
-<script>
-const $ = s => document.querySelector(s);
-async function poll(){
-  try{
-    const r = await fetch('/api/status');
-    const s = await r.json();
-    const hd = s.hand ? '#31c48d' : '#f05252';
-    $('#st').innerHTML =
-      '<div><span class="dot" style="background:'+hd+'"></span>手：<b>'+(s.hand?'已检测':'未检测')+'</b></div>' +
-      '<div>手势：<b>'+(s.gesture||'-')+'</b></div>' +
-      '<div>帧率：<b>'+s.fps+'</b> FPS</div>' +
-      '<div>状态：<b>'+(s.active?'运行中':'待机')+'</b> / '+s.mode+'</div>' +
-      '<div>灵巧手：<b>'+(s.hand_ok?'在线':'离线')+'</b></div>' +
-      '<div style="margin-top:6px;color:#6b7280">'+(s.message||'')+'</div>';
-    $('#score').textContent = s.score.me + ' : ' + s.score.bot + '  (平 ' + s.score.draw + ')';
-    $('#go').disabled = s.active;
-    $('#stop').disabled = !s.active;
-  }catch(e){ $('#st').textContent = '连接断开'; }
-}
-setInterval(poll, 400); poll();
-$('#go').onclick = async () => {
-  const mode = $('#mode').value;
-  await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
-                             body: JSON.stringify({mode})});
-  poll();
-};
-$('#stop').onclick = async () => { await fetch('/api/stop', {method:'POST'}); poll(); };
-</script>
-</body></html>"""
-
-
 @app.route("/")
 def index():
-    return Response(PAGE, mimetype="text/html; charset=utf-8")
+    return render_template("index.html")
 
 
 @app.route("/stream")
@@ -432,6 +349,14 @@ def api_status():
         s = {k: v for k, v in STATE.items() if k != "jpeg"}
     s["ratios"] = {FINGER_CN.get(k, k): round(v, 2) for k, v in s["ratios"].items()}
     return jsonify(s)
+
+
+@app.route("/api/quick")
+def api_quick():
+    """给手势小游戏用的轻量接口（高频轮询，只回必要字段）。"""
+    with LOCK:
+        return jsonify({"hand": STATE["hand"], "gesture": STATE["gesture"],
+                        "active": STATE["active"], "mode": STATE["mode"]})
 
 
 @app.route("/api/start", methods=["POST"])
