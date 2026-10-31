@@ -113,20 +113,29 @@ def draw(frame, lm, w, h, ratios, spans):
 # ---------------- 摄像头 ----------------
 class Camera:
     def __init__(self, idx=0, w=640, h=480):
-        self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        self.idx, self.w, self.h = idx, w, h
+        self.cap = self._open()
         self.frame = None
         self.ts = 0.0
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
 
+    def _open(self):
+        c = cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
+        c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        c.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
+        return c
+
     def _loop(self):
         while True:
             ok, f = self.cap.read()
             if not ok:
-                time.sleep(0.15)
+                # 摄像头被拔出/复位时自动重开，别让整个服务死掉
+                time.sleep(0.3)
+                if not self.cap.isOpened():
+                    self.cap.release()
+                    self.cap = self._open()
                 continue
             with self.lock:
                 self.frame = f
@@ -394,10 +403,12 @@ def main():
             min_hand_detection_confidence=0.5, min_tracking_confidence=0.5))
 
     cam = Camera(int(os.environ.get("DEXH13_CAM", "0")))
-    time.sleep(1.5)
+    for _ in range(24):                       # 最多等 12 秒
+        if cam.get()[0] is not None:
+            break
+        time.sleep(0.5)
     if cam.get()[0] is None:
-        print("摄像头没画面，检查 /dev/video0")
-        return 2
+        print("警告：摄像头暂无画面，服务照常启动（页面会显示 NO HAND）")
 
     ENG = Engine(cam, landmarker)
     ENG.connect_hand()
