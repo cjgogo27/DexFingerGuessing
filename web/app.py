@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""DexH13 网页控制台
+
+浏览器里实时看摄像头画面 → 手摆好了点「开始」→ 选玩法 → 灵巧手开始跟/比。
+
+  /            控制台页面
+  /stream      MJPEG 实时流
+  /api/status  状态 JSON
+  /api/start   开始（POST {"mode": "mimic"|"rps"|"preview"}）
+  /api/stop    停止
+
+启动： python3 web/app.py  →  http://<服务器IP>:8000
+"""
+import json
+import math
+import os
+import random
+import sys
+import threading
+import time
+from collections import deque
+
+import cv2
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE)
+from dexh13 import DexH13, gestures          # noqa: E402
+
+from flask import Flask, Response, jsonify, request   # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL = os.environ.get("DEXH13_HAND_MODEL") or os.path.join(
+    os.path.dirname(HERE), "models", "hand_landmarker.task")
+PORT = int(os.environ.get("DEXH13_WEB_PORT", "8000"))
+
+FINGER_JOINTS = {
+    "thumb":  [(1, 2, 3), (2, 3, 4)],
+    "index":  [(0, 5, 6), (5, 6, 7), (6, 7, 8)],
+    "middle": [(0, 9, 10), (9, 10, 11), (10, 11, 12)],
+    "ring":   [(0, 13, 14), (13, 14, 15), (14, 15, 16)],
+    "pinky":  [(0, 17, 18), (17, 18, 19), (18, 19, 20)],
+}
+FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+FINGER_CN = {"thumb": "拇指", "index": "食指", "middle": "中指", "ring": "无名", "pinky": "小指"}
+MOTOR_FINGER = (["thumb"] * 4) + (["index"] * 3) + (["middle"] * 3) + (["ring"] * 3)
+FIST = gestures.PRESETS["拳头"]
+BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+ROBOT_MOVE = {"rock": "拳头", "paper": "零位", "scissors": "耶"}
+CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+               (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15),
+               (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)]
+MIN_SPAN = 60.0
+
+LOCK = threading.Lock()
+STATE = {
+    "hand": False, "gesture": None, "ratios": {}, "spans": {},
+    "fps": 0.0, "active": False, "mode": "preview",
+    "score": {"me": 0, "bot": 0, "draw": 0},
+    "last": "", "jpeg": None, "hand_ok": False, "message": "",
+}
+
+
+# ---------------- 几何 ----------------
+def to_px(lm, w, h):
+    return [(p.x * w, p.y * h) for p in lm]
+
+
+def angle(a, b, c):
+    v1 = (a[0] - b[0], a[1] - b[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    n1, n2 = math.hypot(*v1), math.hypot(*v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 180.0
+    cos = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+
+
+def flexion(lm, w, h):
+    pts = to_px(lm, w, h)
+    return {n: sum(180.0 - angle(pts[a], pts[b], pts[c]) for a, b, c in t)
+            for n, t in FINGER_JOINTS.items()}
+
+
+def classify(lm, w, h):
+    pts = to_px(lm, w, h)
+    wrist = pts[0]
+    d = lambda p, q: math.hypot(p[0] - q[0], p[1] - q[1])
+    ext = [d(pts[tip], wrist) > d(pts[pip], wrist) * 1.10
+           for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18))]
+    i, m, r, p = ext
+    if i and m and not r and not p:
+        return "scissors"
+    if i and m and r and p:
+        return "paper"
+    if not i and not m and not r and not p:
+        return "rock"
+    return None
+
+
+def draw(frame, lm, w, h, ratios, spans):
+    pts = [(int(x), int(y)) for x, y in to_px(lm, w, h)]
+    for a, b in CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], (0, 255, 0), 2)
+    for p in pts:
+        cv2.circle(frame, p, 3, (0, 0, 255), -1)
+    y = 24
+    for n in FINGER_ORDER:
+        cv2.putText(frame, "%s %.2f" % (n[:3], ratios.get(n, 0.0)), (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        y += 18
+
+
+# ---------------- 摄像头 ----------------
+class Camera:
+    def __init__(self, idx=0, w=640, h=480):
+        self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        self.frame = None
+        self.ts = 0.0
+        self.lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            ok, f = self.cap.read()
+            if not ok:
+                time.sleep(0.15)
+                continue
+            with self.lock:
+                self.frame = f
+                self.ts = time.time()
+
+    def get(self):
+        with self.lock:
+            return (None if self.frame is None else self.frame.copy()), self.ts
+
+
+# ---------------- 引擎 ----------------
+class Engine(threading.Thread):
+    def __init__(self, cam, landmarker):
+        super().__init__(daemon=True)
+        self.cam = cam
+        self.lm = landmarker
+        self.hand = None
+        self.busy = False
+        self.lo = {n: None for n in FINGER_ORDER}
+        self.hi = {n: None for n in FINGER_ORDER}
+        self.smooth = {n: 0.0 for n in FINGER_ORDER}
+        self.settle = deque(maxlen=8)
+        self.last_round = 0.0
+        self.last_send = 0.0
+        self.t0 = time.time()
+        self.fps = 0.0
+        self.sent = 0
+        self.last_ts = 0.0
+
+    # --- 灵巧手 ---
+    def connect_hand(self):
+        try:
+            h = DexH13(port=os.environ.get("DEXH13_PORT") or None)
+            h.connect()
+            self.hand = h
+            with LOCK:
+                STATE["hand_ok"] = True
+                STATE["message"] = "灵巧手已连接 " + h.version()
+        except Exception as e:
+            self.hand = None
+            with LOCK:
+                STATE["hand_ok"] = False
+                STATE["message"] = "灵巧手未连接：%s" % e
+
+    def _do(self, fn):
+        def run():
+            self.busy = True
+            try:
+                fn()
+            except Exception as e:
+                with LOCK:
+                    STATE["message"] = "执行出错：%s" % e
+            finally:
+                self.busy = False
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_mode(self, mode):
+        def go():
+            if self.hand and not STATE["hand_ok"]:
+                pass
+            if self.hand:
+                self.hand.enable()
+                self.hand.move_to([0] * 13, duration=0.6)
+            with LOCK:
+                STATE["active"] = True
+                STATE["mode"] = mode
+                STATE["score"] = {"me": 0, "bot": 0, "draw": 0}
+                STATE["last"] = ""
+            self.settle.clear()
+        self._do(go)
+
+    def stop_mode(self):
+        def go():
+            if self.hand:
+                try:
+                    self.hand.move_to([0] * 13, duration=0.6)
+                    self.hand.disable()
+                except Exception:
+                    pass
+            with LOCK:
+                STATE["active"] = False
+                STATE["mode"] = "preview"
+                STATE["last"] = "已停止"
+        self._do(go)
+
+    def send(self, target):
+        if not self.hand:
+            return
+        try:
+            self.hand.tp.write_regs(0x2050, target)
+            self.sent += 1
+        except Exception:
+            pass
+
+    # --- 主循环 ---
+    def run(self):
+        prev = time.time()
+        while True:
+            frame, ts = self.cam.get()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            # 同一帧不要重复推理，否则 CPU 空转、帧率虚高
+            if ts == self.last_ts:
+                time.sleep(0.004)
+                continue
+            self.last_ts = ts
+            now = time.time()
+            dt = now - prev
+            prev = now
+            self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt if dt > 0 else 0)
+
+            h, w = frame.shape[:2]
+            import mediapipe as mp
+            res = self.lm.detect_for_video(
+                mp.Image(image_format=mp.ImageFormat.SRGB,
+                         data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
+                int((now - self.t0) * 1000))
+
+            with LOCK:
+                mode = STATE["mode"]
+                active = STATE["active"]
+
+            gesture = None
+            ratios = {}
+            if res.hand_landmarks:
+                lm = res.hand_landmarks[0]
+                f = flexion(lm, w, h)
+                for n in FINGER_ORDER:
+                    self.lo[n] = f[n] if self.lo[n] is None else min(self.lo[n], f[n])
+                    self.hi[n] = f[n] if self.hi[n] is None else max(self.hi[n], f[n])
+                    span = self.hi[n] - self.lo[n]
+                    r = ((f[n] - 10.0) / 250.0) if span < MIN_SPAN else ((f[n] - self.lo[n]) / span)
+                    r = max(0.0, min(1.0, r))
+                    self.smooth[n] = 0.7 * self.smooth[n] + 0.3 * r
+                    ratios[n] = self.smooth[n]
+                gesture = classify(lm, w, h)
+                draw(frame, lm, w, h, ratios,
+                     {n: (self.hi[n] - self.lo[n]) for n in FINGER_ORDER})
+
+            with LOCK:
+                STATE["hand"] = bool(res.hand_landmarks)
+                STATE["gesture"] = gesture
+                STATE["ratios"] = ratios
+                STATE["spans"] = {n: (self.hi[n] - self.lo[n]) if self.lo[n] is not None else 0
+                                  for n in FINGER_ORDER}
+                STATE["fps"] = round(self.fps, 1)
+
+            # ---- 控制 ----
+            if active and res.hand_landmarks:
+                if mode == "mimic":
+                    if now - self.last_send >= 1.0 / 25:
+                        self.last_send = now
+                        tgt = [int(round(self.smooth[fg] * FIST[i]))
+                               for i, fg in enumerate(MOTOR_FINGER)]
+                        self.send([max(-1000, min(5000, t)) for t in tgt])
+                elif mode == "rps":
+                    self.settle.append(gesture)
+                    stable = (len(self.settle) == 8 and self.settle[0] is not None
+                              and all(g == self.settle[0] for g in self.settle))
+                    if stable and now - self.last_round > 2.5 and not self.busy:
+                        self.last_round = now
+                        mine = self.settle[0]
+                        self.settle.clear()
+                        robot = random.choice(["rock", "paper", "scissors"])
+                        if mine == robot:
+                            res_txt, key = "平", "draw"
+                        elif BEATS[mine] == robot:
+                            res_txt, key = "你赢", "me"
+                        else:
+                            res_txt, key = "电脑赢", "bot"
+                        with LOCK:
+                            STATE["score"][key] += 1
+                            STATE["last"] = "%s vs %s → %s" % (mine, robot, res_txt)
+                        if self.hand:
+                            self._do(lambda: self.hand.play(ROBOT_MOVE[robot], duration=0.9))
+
+            # ---- 叠字 + 编码 ----
+            color = (0, 255, 0) if active else (160, 160, 160)
+            cv2.putText(frame, "MODE: %s" % mode, (10, h - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            if not res.hand_landmarks:
+                cv2.putText(frame, "NO HAND", (10, h - 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            elif gesture:
+                cv2.putText(frame, gesture.upper(), (w - 200, h - 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                with LOCK:
+                    STATE["jpeg"] = jpg.tobytes()
+
+
+# ---------------- Flask ----------------
+app = Flask(__name__)
+
+PAGE = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DexH13 控制台</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#12141a; color:#e6e8ee;
+         font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; }
+  .view { flex:1; min-width:0; }
+  .view img { width:100%; border-radius:10px; background:#000; display:block; }
+  .panel { width:320px; background:#1a1d26; border-radius:12px; padding:18px; }
+  h1 { font-size:17px; margin:0 0 16px; font-weight:600; letter-spacing:.5px; }
+  .row { margin-bottom:14px; }
+  label { display:block; font-size:12px; color:#8b93a7; margin-bottom:6px; }
+  select, button { width:100%; padding:10px; border-radius:8px; border:1px solid #2b3142;
+                   background:#232838; color:#e6e8ee; font-size:14px; }
+  button.go { background:#1f6feb; border-color:#1f6feb; font-weight:600; }
+  button.stop { background:#3a2130; border-color:#5a2b3f; color:#ff8fae; }
+  button:disabled { opacity:.45; }
+  .stat { font-size:12px; color:#8b93a7; line-height:1.9; }
+  .stat b { color:#e6e8ee; font-weight:600; }
+  .score { font-size:26px; font-weight:700; letter-spacing:2px; text-align:center;
+           padding:10px 0; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+</style></head>
+<body>
+<div class="wrap">
+  <div class="view"><img id="v" src="/stream"></div>
+  <div class="panel">
+    <h1>DexH13 控制台</h1>
+    <div class="row">
+      <label>玩法</label>
+      <select id="mode">
+        <option value="preview">预览（只看不动）</option>
+        <option value="mimic">跟随模仿</option>
+        <option value="rps">猜拳</option>
+      </select>
+    </div>
+    <div class="row">
+      <button id="go" class="go">开始</button>
+    </div>
+    <div class="row">
+      <button id="stop" class="stop">停止</button>
+    </div>
+    <div class="row">
+      <label>比分（猜拳）</label>
+      <div class="score" id="score">0 : 0</div>
+    </div>
+    <div class="stat" id="st">连接中…</div>
+  </div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+async function poll(){
+  try{
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    const hd = s.hand ? '#31c48d' : '#f05252';
+    $('#st').innerHTML =
+      '<div><span class="dot" style="background:'+hd+'"></span>手：<b>'+(s.hand?'已检测':'未检测')+'</b></div>' +
+      '<div>手势：<b>'+(s.gesture||'-')+'</b></div>' +
+      '<div>帧率：<b>'+s.fps+'</b> FPS</div>' +
+      '<div>状态：<b>'+(s.active?'运行中':'待机')+'</b> / '+s.mode+'</div>' +
+      '<div>灵巧手：<b>'+(s.hand_ok?'在线':'离线')+'</b></div>' +
+      '<div style="margin-top:6px;color:#6b7280">'+(s.message||'')+'</div>';
+    $('#score').textContent = s.score.me + ' : ' + s.score.bot + '  (平 ' + s.score.draw + ')';
+    $('#go').disabled = s.active;
+    $('#stop').disabled = !s.active;
+  }catch(e){ $('#st').textContent = '连接断开'; }
+}
+setInterval(poll, 400); poll();
+$('#go').onclick = async () => {
+  const mode = $('#mode').value;
+  await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
+                             body: JSON.stringify({mode})});
+  poll();
+};
+$('#stop').onclick = async () => { await fetch('/api/stop', {method:'POST'}); poll(); };
+</script>
+</body></html>"""
+
+
+@app.route("/")
+def index():
+    return Response(PAGE, mimetype="text/html; charset=utf-8")
+
+
+@app.route("/stream")
+def stream():
+    def gen():
+        while True:
+            with LOCK:
+                jpg = STATE["jpeg"]
+            if jpg:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                       str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                time.sleep(0.03)
+            else:
+                time.sleep(0.05)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/api/status")
+def api_status():
+    with LOCK:
+        s = {k: v for k, v in STATE.items() if k != "jpeg"}
+    s["ratios"] = {FINGER_CN.get(k, k): round(v, 2) for k, v in s["ratios"].items()}
+    return jsonify(s)
+
+
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "mimic")
+    if mode not in ("mimic", "rps", "preview"):
+        return jsonify({"ok": False, "error": "mode?"}), 400
+    if not ENG:
+        return jsonify({"ok": False, "error": "engine not running"}), 503
+    ENG.start_mode(mode)
+    return jsonify({"ok": True, "mode": mode})
+
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    if ENG:
+        ENG.stop_mode()
+    return jsonify({"ok": True})
+
+
+def main():
+    global ENG
+    if not os.path.exists(MODEL):
+        print("缺少模型：", MODEL)
+        return 2
+    import mediapipe as mp
+    from mediapipe.tasks import python as mpp
+    from mediapipe.tasks.python import vision
+
+    landmarker = vision.HandLandmarker.create_from_options(
+        vision.HandLandmarkerOptions(
+            base_options=mpp.BaseOptions(model_asset_path=MODEL),
+            running_mode=vision.RunningMode.VIDEO, num_hands=1,
+            min_hand_detection_confidence=0.5, min_tracking_confidence=0.5))
+
+    cam = Camera(int(os.environ.get("DEXH13_CAM", "0")))
+    time.sleep(1.5)
+    if cam.get()[0] is None:
+        print("摄像头没画面，检查 /dev/video0")
+        return 2
+
+    ENG = Engine(cam, landmarker)
+    ENG.connect_hand()
+    ENG.start()
+    print("控制台已启动： http://%s:%d" % (os.environ.get("DEXH13_HOST", "0.0.0.0"), PORT))
+    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False, use_reloader=False)
+    return 0
+
+
+ENG = None
+if __name__ == "__main__":
+    sys.exit(main())
