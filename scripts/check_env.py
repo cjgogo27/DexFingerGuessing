@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HighFive 环境自检：一条命令告诉你缺什么。
+"""HandPlay 环境自检：一条命令告诉你缺什么。
 
     python3 scripts/check_env.py
 
