@@ -121,11 +121,25 @@ class Camera:
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _open(self):
-        c = cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
-        c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        c.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
-        c.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
-        return c
+        """打开摄像头。先试 MJPG（省带宽），不行退回驱动默认格式。
+
+        便宜的 UVC 摄像头在反复开关后经常只剩默认格式能用，
+        不做回退会表现为 select() timeout。
+        """
+        for fourcc in ("MJPG", None):
+            c = cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
+            if not c.isOpened():
+                c.release()
+                continue
+            if fourcc:
+                c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
+            ok, _ = c.read()
+            if ok:
+                return c
+            c.release()
+        return cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
 
     def _loop(self):
         while True:
