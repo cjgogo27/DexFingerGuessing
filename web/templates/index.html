@@ -69,6 +69,10 @@
       <button id="gclose" class="go" style="background:#1f6feb">闭合</button>
       <button id="gopen" class="stop" style="background:#232838;color:#e6e8ee">张开</button>
     </div>
+    <div class="row" style="display:flex;gap:8px">
+      <button id="grasp" class="go" style="background:#8a5a00">力控抓握</button>
+      <button id="rec" class="reset" style="flex:1">开始录制</button>
+    </div>
     <div class="row"><div class="score" id="score">0 : 0</div></div>
 
     <hr>
@@ -225,6 +229,29 @@ $('#qstart').onclick = () => {
       $('#tgt').textContent = '得分 ' + qScore;
     }
   }, 1000);
+};
+$('#grasp').onclick = async () => {
+  const b = $('#grasp');
+  b.disabled = true; b.textContent = '抓握中…';
+  try { await fetch('/api/grasp', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }
+  catch(e){}
+  setTimeout(()=>{ b.disabled = false; b.textContent = '力控抓握'; }, 12000);
+};
+
+let recOn = false;
+$('#rec').onclick = async () => {
+  const b = $('#rec');
+  b.disabled = true;
+  try {
+    const r = await fetch(recOn ? '/api/record/stop' : '/api/record/start',
+                          {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const d = await r.json();
+    recOn = !recOn;
+    b.textContent = recOn ? '停止录制' : '开始录制';
+    b.style.background = recOn ? '#8a1c1c' : '';
+    if(d.dir) $('#tgt').textContent = (recOn ? '录制中 ' : '已保存 ') + d.dir.split('/').pop();
+  } catch(e){}
+  b.disabled = false;
 };
 </script>
 </body>

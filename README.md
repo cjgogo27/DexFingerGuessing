@@ -97,6 +97,13 @@ scripts/    fetch_model.sh · check_env.py
 非官方项目。协议由逆向 `pxdex-h13` 上位机得到，仅用于互操作与研究；
 相关商标与著作权归帕西尼（PaXini）所有。
 
+
+## 数据与力控
+
+- **遥操作数据采集**：控制台点「开始录制」，落 `records/<时间戳>/trace.csv`（30 Hz，含目标/实测位置/电流/比值）
+- **力控抓握**：点「力控抓握」，逐级合拢，电流或位置停滞即冻结，用来捏住但不捏碎
+
+详见 [docs/DATA.md](docs/DATA.md)。
 ## License
 
 MIT（仅本项目代码）。依赖：MediaPipe / OpenCV（Apache-2.0）、pyserial（BSD）、Flask（BSD）。

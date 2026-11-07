@@ -11,6 +11,8 @@
 
 启动： python3 web/app.py  →  http://<服务器IP>:8000
 """
+import csv
+import datetime
 import json
 import math
 import os
@@ -62,6 +64,9 @@ STATE = {
 
 
 # ---------------- VR（WebXR）----------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REC = {"on": False, "dir": None, "n": 0, "f": None, "w": None, "t0": 0.0}
+
 XR_LOCK = threading.Lock()
 XR_STATE = {"t": 0.0, "targets": None, "ratios": {}, "hb_t": 0.0, "frames": 0,
             "ev": "", "err": "", "ev_t": 0.0, "build": ""}
@@ -190,6 +195,9 @@ class Engine(threading.Thread):
         self.sent = 0
         self.last_ts = 0.0
         self.last_sense = 0.0
+        self.last_rec = 0.0
+        self.grasp = None          # 力控抓握任务（后台线程用）
+        self.grasp_trace = []
 
     # --- 灵巧手 ---
     def connect_hand(self):
@@ -295,11 +303,11 @@ class Engine(threading.Thread):
             with LOCK:
                 _mode = STATE["mode"]
                 _active = STATE["active"]
+            _now2 = time.time()
             if _mode == "vr" and _active and self.hand:
                 if not self.enabled:
                     self.hand.enable()
                     self.enabled = True
-                _now2 = time.time()
                 if _now2 - self.last_send >= 1.0 / 25:
                     self.last_send = _now2
                     with XR_LOCK:
@@ -307,6 +315,24 @@ class Engine(threading.Thread):
                         _tgt = list(XR_STATE["targets"]) if _fresh else None
                     if _tgt:
                         self.send(_tgt)
+
+            # ---- 数据录制（30 Hz）：目标 / 实际位置 / 电流 / VR 输入 ----
+            if REC["on"] and self.hand and _now2 - self.last_rec >= 1.0 / 30:
+                self.last_rec = _now2
+                try:
+                    pos = _to_signed(self.hand.tp.read_regs(0x1050, 13))
+                    cur = _to_signed(self.hand.tp.read_regs(0x1060, 13))
+                    with XR_LOCK:
+                        tgt = list(XR_STATE["targets"] or [0] * 13)
+                        rat = dict(XR_STATE["ratios"])
+                    with LOCK:
+                        _m = STATE["mode"]
+                    REC["w"].writerow(
+                        [round(_now2 - REC["t0"], 4), _m] + tgt + pos + cur +
+                        [round(rat.get(k, 0.0), 4) for k in ("thumb", "index", "middle", "ring")])
+                    REC["n"] += 1
+                except Exception:
+                    pass
 
             # 触觉 / 电流轮询：与摄像头无关，没画面也照采
             _now = time.time()
@@ -459,6 +485,10 @@ def xr_page():
     return resp
 
 
+def _to_signed(vals):
+    return [v - 65536 if v > 32767 else v for v in vals]
+
+
 def handle_xr(msg):
     """收到头显数据：重定向并写入共享状态。
 
@@ -528,12 +558,79 @@ if sock:
                 continue
 
 
+@app.route("/api/record/start", methods=["POST"])
+def api_rec_start():
+    if REC["on"]:
+        return jsonify({"ok": False, "error": "已经在录制"})
+    d = request.get_json(silent=True) or {}
+    name = d.get("name") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    outdir = os.path.join(BASE_DIR, "records", name)
+    os.makedirs(outdir, exist_ok=True)
+    f = open(os.path.join(outdir, "trace.csv"), "w", newline="", encoding="utf-8")
+    w = csv.writer(f)
+    w.writerow(["t", "mode"] + ["tgt%d" % i for i in range(13)] +
+               ["pos%d" % i for i in range(13)] + ["cur%d" % i for i in range(13)] +
+               ["r_thumb", "r_index", "r_middle", "r_ring"])
+    REC.update({"on": True, "dir": outdir, "n": 0, "f": f, "w": w, "t0": time.time()})
+    return jsonify({"ok": True, "dir": outdir})
+
+
+@app.route("/api/record/stop", methods=["POST"])
+def api_rec_stop():
+    if REC["on"]:
+        try:
+            REC["f"].close()
+        except Exception:
+            pass
+        REC.update({"on": False, "f": None, "w": None})
+    return jsonify({"ok": True, "n": REC["n"], "dir": REC["dir"]})
+
+
+@app.route("/api/grasp", methods=["POST"])
+def api_grasp():
+    if not ENG or not ENG.hand:
+        return jsonify({"ok": False, "error": "灵巧手未连接"}), 503
+    if ENG.grasp:
+        return jsonify({"ok": False, "error": "抓握进行中"})
+    d = request.get_json(silent=True) or {}
+    try:
+        from dexh13.grasp import ForceGrasp
+    except Exception as e:
+        return jsonify({"ok": False, "error": "缺少 grasp 模块: %s" % e}), 500
+
+    def job():
+        g = ForceGrasp(ENG.hand,
+                       delta=int(d.get("delta", 150)),
+                       step=int(d.get("step", 80)),
+                       hold=float(d.get("hold", 1.2)))
+        ENG.grasp = g
+        try:
+            if not ENG.enabled:
+                ENG.hand.enable()
+                ENG.enabled = True
+            res = g.run()
+            ENG.grasp_trace = g.trace[-200:]
+            with LOCK:
+                STATE["message"] = "抓握完成：%d 指触发，%.1fs" % (len(res["frozen"]), res["elapsed"])
+            print("grasp:", res)
+        except Exception as e:
+            with LOCK:
+                STATE["message"] = "抓握出错：%s" % e
+        finally:
+            ENG.grasp = None
+
+    threading.Thread(target=job, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/status")
 def api_status():
     with LOCK:
         s = {k: v for k, v in STATE.items() if k != "jpeg"}
     s["ratios"] = {FINGER_CN.get(k, k): round(v, 2) for k, v in s["ratios"].items()}
     now = time.time()
+    s["rec"] = {"on": REC["on"], "n": REC["n"], "dir": REC["dir"]}
+    s["grasp"] = {"on": bool(ENG and ENG.grasp), "trace": (ENG.grasp_trace[-60:] if ENG else [])}
     s["vr"] = {"age": round(now - XR_STATE["t"], 2) if XR_STATE["t"] else None,
                "hb_age": round(now - XR_STATE["hb_t"], 2) if XR_STATE["hb_t"] else None,
                "frames": XR_STATE["frames"],
