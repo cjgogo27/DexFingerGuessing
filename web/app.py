@@ -442,26 +442,44 @@ def xr_page():
     return render_template("xr.html")
 
 
+def handle_xr(msg):
+    """收到头显数据：重定向并写入共享状态。"""
+    if RETARGET is None:
+        return
+    d = json.loads(msg)
+    joints = d.get("hand")
+    if not joints or len(joints) != 25:
+        return
+    tgt, ratios = RETARGET.update(joints)
+    with XR_LOCK:
+        XR_STATE["t"] = time.time()
+        XR_STATE["targets"] = tgt
+        XR_STATE["ratios"] = ratios
+    # 收到 VR 数据就自动把模式切到 vr，省得用户漏选
+    with LOCK:
+        if STATE["mode"] != "vr":
+            STATE["mode"] = "vr"
+
+
+@app.route("/api/xr_frame", methods=["POST"])
+def api_xr_frame():
+    """HTTP 后备通道：wss 被证书挡住时用这个。"""
+    try:
+        handle_xr(request.get_data(as_text=True))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 if sock:
     @sock.route("/ws/xr")
     def ws_xr(ws):
-        """收头显推上来的 25 个手部关节，重定向成 13 个电机目标。"""
         while True:
             msg = ws.receive()
             if msg is None:
                 break
             try:
-                d = json.loads(msg)
-                joints = d.get("hand")
-                if not joints or len(joints) != 25:
-                    continue
-                if RETARGET is None:
-                    continue
-                tgt, ratios = RETARGET.update(joints)
-                with XR_LOCK:
-                    XR_STATE["t"] = time.time()
-                    XR_STATE["targets"] = tgt
-                    XR_STATE["ratios"] = ratios
+                handle_xr(msg)
             except Exception:
                 continue
 
