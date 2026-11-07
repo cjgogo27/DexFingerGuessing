@@ -100,7 +100,12 @@ async function enter(){
   function onFrame(t, frame){
     session.requestAnimationFrame(onFrame);
     let pts = null;
-    for(const src of session.inputSources){
+    const srcs = session.inputSources;
+    let nSrc = srcs ? srcs.length : 0, nHand = 0;
+    for(const src of (srcs || [])){
+      if(src.hand) nHand++;
+    }
+    for(const src of (srcs || [])){
       if(!src.hand) continue;
       pts = [];
       for(const name of JOINTS){
@@ -122,7 +127,9 @@ async function enter(){
     if(t - tPrev > 500){
       fps = (fps*0.5 + (sending*1000/(t-tPrev))*0.5) || 0;
       sending = 0; tPrev = t;
-      stat.innerHTML = '<div>手：<b class="ok">已追踪</b></div>' +
+      const handTxt = nHand > 0 ? '<b class="ok">已追踪</b>' : '<b class="bad">未追踪</b>';
+      stat.innerHTML = '<div>手：' + handTxt + '</div>' +
+                       '<div>输入源：<b>' + nSrc + '</b> 个，含手部数据 <b>' + nHand + '</b> 个</div>' +
                        '<div>发送：<b>' + fps.toFixed(0) + '</b> Hz</div>' +
                        '<div>WebSocket：<b>' + (ws && ws.readyState===1 ? '已连接' : '未连接') + '</b></div>';
     }

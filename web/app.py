@@ -57,6 +57,7 @@ STATE = {
     "fps": 0.0, "active": False, "mode": "preview",
     "score": {"me": 0, "bot": 0, "draw": 0},
     "last": "", "jpeg": None, "hand_ok": False, "message": "",
+    "tactile": [], "current": [], "pending": None,
 }
 
 
@@ -187,6 +188,7 @@ class Engine(threading.Thread):
         self.fps = 0.0
         self.sent = 0
         self.last_ts = 0.0
+        self.last_sense = 0.0
 
     # --- 灵巧手 ---
     def connect_hand(self):
@@ -276,6 +278,33 @@ class Engine(threading.Thread):
     def run(self):
         prev = time.time()
         while True:
+            # 待执行的抓握动作（与采集同线程，避免串口竞争）
+            with LOCK:
+                _act = STATE.get("pending")
+                STATE["pending"] = None
+            if _act and self.hand:
+                if not self.enabled:
+                    self.hand.enable()
+                    self.enabled = True
+                self.hand.move_to(gestures.PRESETS["拳头"] if _act == "close" else [0] * 13, duration=1.2)
+                with LOCK:
+                    STATE["message"] = "已闭合" if _act == "close" else "已张开"
+
+            # 触觉 / 电流轮询：与摄像头无关，没画面也照采
+            _now = time.time()
+            if self.hand and _now - self.last_sense > 0.1:
+                self.last_sense = _now
+                try:
+                    tac = [v - 65536 if v > 32767 else v
+                           for v in self.hand.tp.read_regs(0x4000, 17)]
+                    cur = [v - 65536 if v > 32767 else v
+                           for v in self.hand.tp.read_regs(0x1060, 13)]
+                    with LOCK:
+                        STATE["tactile"] = tac
+                        STATE["current"] = cur
+                except Exception:
+                    pass
+
             frame, ts = self.cam.get()
             if frame is None:
                 time.sleep(0.01)
@@ -452,7 +481,8 @@ def api_quick():
     """给手势小游戏用的轻量接口（高频轮询，只回必要字段）。"""
     with LOCK:
         return jsonify({"hand": STATE["hand"], "gesture": STATE["gesture"],
-                        "active": STATE["active"], "mode": STATE["mode"]})
+                        "active": STATE["active"], "mode": STATE["mode"],
+                        "tactile": STATE["tactile"], "current": STATE["current"]})
 
 
 @app.route("/api/start", methods=["POST"])
@@ -471,6 +501,15 @@ def api_start():
 def api_stop():
     if ENG:
         ENG.stop_mode()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/gripper", methods=["POST"])
+def api_gripper():
+    """手动闭合 / 张开，用于观察触觉与电流。"""
+    data = request.get_json(silent=True) or {}
+    with LOCK:
+        STATE["pending"] = "close" if data.get("close") else "open"
     return jsonify({"ok": True})
 
 

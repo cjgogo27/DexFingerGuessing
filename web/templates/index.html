@@ -33,6 +33,14 @@
   .target { font-size:30px; font-weight:700; text-align:center; padding:8px 0; color:#ffd166; }
   .now { font-size:13px; text-align:center; color:#8b93a7; padding-bottom:6px; }
   .now b { color:#31c48d; }
+  .sense { margin-top:12px; }
+  .sense .t { font-size:11px; color:#8b93a7; margin:8px 0 4px; }
+  .bars { display:flex; gap:2px; height:52px; align-items:flex-end; }
+  .bars i { flex:1; background:#31c48d; min-height:1px; border-radius:1px 1px 0 0;
+            transition: height .08s linear; }
+  .bars.cur i { background:#5b9cf5; }
+  canvas.chart { width:100%; height:96px; display:block; background:#0e1017;
+                 border-radius:6px; margin-top:6px; }
 </style>
 </head>
 <body>
@@ -51,9 +59,16 @@
         <option value="vr">VR 遥操作</option>
       </select>
     </div>
+    <div class="row">
+      <a href="/xr" style="display:block;text-align:center;padding:10px;border-radius:8px;background:#2b1a3a;border:1px solid #5a2b7f;color:#d9a6ff;text-decoration:none;font-size:13px">🎮 头显页面：/xr（点这里打开）</a>
+    </div>
     <div class="row"><button id="go" class="go">开始</button></div>
     <div class="row"><button id="stop" class="stop">停止</button></div>
     <div class="row"><button id="reset" class="reset">复位到零位</button></div>
+    <div class="row" style="display:flex;gap:8px">
+      <button id="gclose" class="go" style="background:#1f6feb">闭合</button>
+      <button id="gopen" class="stop" style="background:#232838;color:#e6e8ee">张开</button>
+    </div>
     <div class="row"><div class="score" id="score">0 : 0</div></div>
 
     <hr>
@@ -65,6 +80,15 @@
       <button id="qstart" class="go" style="margin-top:8px">开始挑战</button>
     </div>
 
+    <hr>
+    <div class="sense">
+      <div class="t">触觉（固件 1.4.4 开放通道）</div>
+      <div class="bars" id="tacbars"></div>
+      <canvas class="chart" id="tacchart" width="600" height="192"></canvas>
+      <div class="t">电流 mA</div>
+      <div class="bars cur" id="curbars"></div>
+      <canvas class="chart" id="curchart" width="600" height="192"></canvas>
+    </div>
     <hr>
     <div class="stat" id="st">连接中…</div>
   </div>
@@ -93,6 +117,66 @@ async function poll(){
 }
 setInterval(poll, 500); poll();
 
+// ---------- 触觉 / 电流 ----------
+const TAC_N = 17, CUR_N = 13;
+function mkBars(el, n){ el.innerHTML = ''; for(let i=0;i<n;i++) el.appendChild(document.createElement('i')); }
+mkBars($('#tacbars'), TAC_N); mkBars($('#curbars'), CUR_N);
+
+function drawBars(el, vals, floor){
+  if(!vals || !vals.length) return;
+  const kids = el.children;
+  const mx = Math.max(floor || 100, ...vals.map(v => Math.abs(v)));
+  for(let i=0;i<kids.length && i<vals.length;i++){
+    const p = Math.min(1, Math.abs(vals[i]) / mx);
+    kids[i].style.height = (2 + p * 48) + 'px';
+    kids[i].style.opacity = 0.25 + 0.75 * p;
+  }
+}
+
+// ---------- 波形 ----------
+const HIST = 150;
+const tacHist = [], curHist = [];
+const TAC_COLORS = ['#31c48d','#ffd166','#ff8fae','#7dd3fc','#c084fc'];
+
+function pushHist(hist, vals){ hist.push(vals.slice()); if(hist.length > HIST) hist.shift(); }
+
+function drawChart(cv, hist, colors, floor){
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0,0,W,H);
+  if(!hist.length) return;
+  const n = Math.max(...hist.map(a => a.length));
+  let mx = floor;
+  for(const row of hist) for(const v of row) mx = Math.max(mx, Math.abs(v));
+  ctx.strokeStyle = '#1e2430'; ctx.lineWidth = 1;
+  for(let g=1; g<4; g++){ const y = H*g/4; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  for(let i=0;i<n;i++){
+    ctx.beginPath();
+    ctx.strokeStyle = colors[i % colors.length];
+    ctx.lineWidth = 3;
+    hist.forEach((row, k) => {
+      const x = W * k / Math.max(1, HIST-1);
+      const v = Math.abs(row[i] || 0) / mx;
+      const y = H - v * (H - 6) - 3;
+      k === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+}
+
+async function sense(){
+  try{
+    const s = await (await fetch('/api/quick')).json();
+    const tac = s.tactile || [], cur = s.current || [];
+    drawBars($('#tacbars'), tac, 400);
+    drawBars($('#curbars'), cur, 80);
+    if(tac.length){ pushHist(tacHist, tac); drawChart($('#tacchart'), tacHist, TAC_COLORS, 600); }
+    if(cur.length){ pushHist(curHist, cur); drawChart($('#curchart'), curHist, ['#5b9cf5'], 200); }
+  }catch(e){}
+  setTimeout(sense, 140);
+}
+sense();
+
 $('#go').onclick = async () => {
   await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
                              body: JSON.stringify({mode: $('#mode').value})});
@@ -100,6 +184,8 @@ $('#go').onclick = async () => {
 };
 $('#stop').onclick = async () => { await fetch('/api/stop', {method:'POST'}); poll(); };
 $('#reset').onclick = async () => { await fetch('/api/reset', {method:'POST'}); poll(); };
+$('#gclose').onclick = () => fetch('/api/gripper', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({close:true})});
+$('#gopen').onclick  = () => fetch('/api/gripper', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({close:false})});
 
 // ---------- 手势小游戏 ----------
 let qOn = false, qScore = 0, qLeft = 30, qTarget = null, qTick = null, qTimer = null;
