@@ -128,9 +128,34 @@ def draw(frame, lm, w, h, ratios, spans):
 
 
 # ---------------- 摄像头 ----------------
+def pick_camera():
+    """挑一个能真正出画面的摄像头。
+
+    USB 重新枚举后 /dev/video0 常常变成 1、2，写死编号就会黑屏。
+    优先用 DEXH13_CAM 指定的路径，否则从 /dev/video0..7 里实测。
+    """
+    pref = os.environ.get("DEXH13_CAM")
+    if pref and os.path.exists(pref):
+        return pref
+    for i in range(8):
+        path = "/dev/video%d" % i
+        if not os.path.exists(path):
+            continue
+        cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            cap.release()
+            if ok:
+                return path
+        else:
+            cap.release()
+    return "/dev/video0"
+
+
 class Camera:
-    def __init__(self, idx=0, w=640, h=480):
-        self.idx, self.w, self.h = idx, w, h
+    def __init__(self, idx=None, w=640, h=480):
+        self.idx = idx if idx is not None else pick_camera()
+        self.w, self.h = w, h
         self.fmt = "MJPG"
         self.cap = self._open(self.fmt)
         self.frame = None
