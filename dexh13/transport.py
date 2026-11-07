@@ -1,6 +1,7 @@
 """串口收发层：只管一问一答，不懂业务语义。"""
 from __future__ import annotations
 
+import threading
 import time
 
 from . import protocol as P
@@ -26,6 +27,7 @@ class Transport:
         self.port = port
         self.baud = baud
         self.addr = addr
+        self._io_lock = threading.Lock()   # 串口只能一问一答，多线程必须互斥
         self.timeout = timeout
         self.ser = None
 
@@ -87,7 +89,8 @@ class Transport:
 
     # ---------- 业务原语 ----------
     def read_regs(self, reg: int, count: int, signed: bool = False):
-        payload = self._transact(P.build_read(self.addr, reg, count), "read")
+        with self._io_lock:
+            payload = self._transact(P.build_read(self.addr, reg, count), "read")
         if not check_crc(payload):
             raise HandTimeout("CRC 校验失败：%s" % payload.hex())
         data = payload[3:-2]
@@ -95,11 +98,12 @@ class Transport:
                 for i in range(0, len(data) - 1, 2)]
 
     def write_regs(self, reg: int, values) -> None:
-        payload = self._transact(P.build_write(self.addr, reg, values), "write")
+        with self._io_lock:
+            payload = self._transact(P.build_write(self.addr, reg, values), "write")
         if not check_crc(payload):
             raise HandTimeout("CRC 校验失败：%s" % payload.hex())
 
-    # ---------- 便捷包装 ----------
+        # ---------- 便捷包装 ----------
     def version(self) -> str:
         regs = self.read_regs(P.REG_VERSION, 14)
         raw = b"".join(r.to_bytes(2, "big") for r in regs)

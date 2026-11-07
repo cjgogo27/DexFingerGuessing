@@ -26,7 +26,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
 from dexh13 import DexH13, gestures          # noqa: E402
 
-from flask import Flask, Response, jsonify, render_template, request   # noqa: E402
+from flask import Flask, Response, jsonify, make_response, render_template, request   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ.get("DEXH13_HAND_MODEL") or os.path.join(
@@ -63,7 +63,8 @@ STATE = {
 
 # ---------------- VR（WebXR）----------------
 XR_LOCK = threading.Lock()
-XR_STATE = {"t": 0.0, "targets": None, "ratios": {}}
+XR_STATE = {"t": 0.0, "targets": None, "ratios": {}, "hb_t": 0.0, "frames": 0,
+            "ev": "", "err": "", "ev_t": 0.0, "build": ""}
 try:
     from dexh13.retarget import XRRetargeter
     RETARGET = XRRetargeter()
@@ -290,6 +291,23 @@ class Engine(threading.Thread):
                 with LOCK:
                     STATE["message"] = "已闭合" if _act == "close" else "已张开"
 
+            # ---- VR 模式：不依赖摄像头，直接下发头显给的目标 ----
+            with LOCK:
+                _mode = STATE["mode"]
+                _active = STATE["active"]
+            if _mode == "vr" and _active and self.hand:
+                if not self.enabled:
+                    self.hand.enable()
+                    self.enabled = True
+                _now2 = time.time()
+                if _now2 - self.last_send >= 1.0 / 25:
+                    self.last_send = _now2
+                    with XR_LOCK:
+                        _fresh = (_now2 - XR_STATE["t"] < 0.6) and XR_STATE["targets"]
+                        _tgt = list(XR_STATE["targets"]) if _fresh else None
+                    if _tgt:
+                        self.send(_tgt)
+
             # 触觉 / 电流轮询：与摄像头无关，没画面也照采
             _now = time.time()
             if self.hand and _now - self.last_sense > 0.1:
@@ -357,15 +375,7 @@ class Engine(threading.Thread):
 
             # ---- 控制 ----
             if active and res.hand_landmarks:
-                if mode == "vr":
-                    if now - self.last_send >= 1.0 / 25:
-                        self.last_send = now
-                        with XR_LOCK:
-                            fresh = (now - XR_STATE["t"] < 0.6) and XR_STATE["targets"]
-                            tgt = list(XR_STATE["targets"]) if fresh else None
-                        if tgt:
-                            self.send(tgt)
-                elif mode == "mimic":
+                if mode == "mimic":
                     if now - self.last_send >= 1.0 / 25:
                         self.last_send = now
                         tgt = [int(round(self.smooth[fg] * FIST[i]))
@@ -419,7 +429,9 @@ except Exception:                      # 没装 flask-sock 时退化为无 VR �
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    resp = make_response(render_template("index.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/stream")
@@ -439,16 +451,48 @@ def stream():
 
 @app.route("/xr")
 def xr_page():
-    return render_template("xr.html")
+    """头显页面。禁止缓存——否则头显浏览器会一直跑旧 JS。"""
+    resp = make_response(render_template("xr.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 def handle_xr(msg):
-    """收到头显数据：重定向并写入共享状态。"""
-    if RETARGET is None:
-        return
+    """收到头显数据：重定向并写入共享状态。
+
+    没有 hand 字段也接受——那是心跳，用来判断"链路通不通"。
+    """
     d = json.loads(msg)
+    now = time.time()
+    with XR_LOCK:
+        XR_STATE["hb_t"] = now
+        XR_STATE["frames"] += 1
+        if d.get("v"):
+            XR_STATE["build"] = str(d["v"])[:20]
+        if d.get("ev"):
+            XR_STATE["ev"] = str(d["ev"])[:40]
+            XR_STATE["ev_t"] = now
+        if d.get("err"):
+            XR_STATE["err"] = str(d["err"])[:200]
+    grip = d.get("grip")
+    if grip is not None:
+        # 手柄扳机：0=张开，1=握紧，所有手指同步
+        g = max(0.0, min(1.0, float(grip)))
+        tgt = [int(round(g * FIST[i])) for i in range(13)]
+        with XR_LOCK:
+            XR_STATE["t"] = now
+            XR_STATE["targets"] = tgt
+            XR_STATE["ratios"] = {f: round(g, 3) for f in ("thumb", "index", "middle", "ring")}
+        with LOCK:
+            if STATE["mode"] != "vr":
+                STATE["mode"] = "vr"
+        return
     joints = d.get("hand")
-    if not joints or len(joints) != 25:
+    if not joints:
+        return
+    if RETARGET is None or len(joints) != 25:
         return
     tgt, ratios = RETARGET.update(joints)
     with XR_LOCK:
@@ -489,7 +533,14 @@ def api_status():
     with LOCK:
         s = {k: v for k, v in STATE.items() if k != "jpeg"}
     s["ratios"] = {FINGER_CN.get(k, k): round(v, 2) for k, v in s["ratios"].items()}
-    s["vr"] = {"age": round(time.time() - XR_STATE["t"], 2) if XR_STATE["t"] else None,
+    now = time.time()
+    s["vr"] = {"age": round(now - XR_STATE["t"], 2) if XR_STATE["t"] else None,
+               "hb_age": round(now - XR_STATE["hb_t"], 2) if XR_STATE["hb_t"] else None,
+               "frames": XR_STATE["frames"],
+               "ev": XR_STATE["ev"],
+               "build": XR_STATE["build"],
+               "ev_age": round(now - XR_STATE["ev_t"], 1) if XR_STATE["ev_t"] else None,
+               "err": XR_STATE["err"],
                "ratios": {k: round(v, 2) for k, v in XR_STATE["ratios"].items()}}
     return jsonify(s)
 
