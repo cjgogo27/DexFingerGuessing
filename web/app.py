@@ -58,7 +58,7 @@ STATE = {
     "hand": False, "gesture": None, "ratios": {}, "spans": {},
     "fps": 0.0, "active": False, "mode": "preview",
     "score": {"me": 0, "bot": 0, "draw": 0},
-    "last": "", "jpeg": None, "hand_ok": False, "message": "",
+    "last": "", "jpeg": None, "jpeg_id": 0, "hand_ok": False, "message": "",
     "tactile": [], "current": [], "pending": None,
 }
 
@@ -185,10 +185,19 @@ class Camera:
                 # 避免高频重试把 UVC 打成 EPROTO
                 fails += 1
                 time.sleep(min(0.3 * (2 ** min(fails, 4)), 5.0))
-                if not self.cap.isOpened():
+                # 连续失败：设备可能重新枚举换了编号，重新挑一次
+                if (not self.cap.isOpened()) or fails >= 3:
                     self.cap.release()
+                    try:
+                        new_dev = pick_camera()
+                        if new_dev:
+                            self.idx = new_dev
+                    except Exception:
+                        pass
                     self.fmt = None if self.fmt == "MJPG" else "MJPG"
                     self.cap = self._open(self.fmt)
+                    with LOCK:
+                        STATE["message"] = "摄像头重连：%s" % self.idx
                 continue
             fails = 0
             with self.lock:
@@ -463,10 +472,11 @@ class Engine(threading.Thread):
             elif gesture:
                 cv2.putText(frame, gesture.upper(), (w - 200, h - 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             if ok:
                 with LOCK:
                     STATE["jpeg"] = jpg.tobytes()
+                STATE["jpeg_id"] += 1
 
 
 # ---------------- Flask ----------------
@@ -487,17 +497,25 @@ def index():
 
 @app.route("/stream")
 def stream():
+    """MJPEG 流：只在有新帧时推送，避免重复发同一张图把带宽吃满。"""
     def gen():
+        last_id = -1
         while True:
             with LOCK:
                 jpg = STATE["jpeg"]
-            if jpg:
+                jid = STATE["jpeg_id"]
+            if jpg and jid != last_id:
+                last_id = jid
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
                        str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
-                time.sleep(0.03)
             else:
-                time.sleep(0.05)
-    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+                time.sleep(0.005)
+    resp = Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Connection"] = "close"
+    return resp
 
 
 @app.route("/xr")
