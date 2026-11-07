@@ -60,6 +60,16 @@ STATE = {
 }
 
 
+# ---------------- VR（WebXR）----------------
+XR_LOCK = threading.Lock()
+XR_STATE = {"t": 0.0, "targets": None, "ratios": {}}
+try:
+    from dexh13.retarget import XRRetargeter
+    RETARGET = XRRetargeter()
+except Exception:                      # 没有 VR 模块也不影响原有功能
+    RETARGET = None
+
+
 # ---------------- 几何 ----------------
 def to_px(lm, w, h):
     return [(p.x * w, p.y * h) for p in lm]
@@ -318,7 +328,15 @@ class Engine(threading.Thread):
 
             # ---- 控制 ----
             if active and res.hand_landmarks:
-                if mode == "mimic":
+                if mode == "vr":
+                    if now - self.last_send >= 1.0 / 25:
+                        self.last_send = now
+                        with XR_LOCK:
+                            fresh = (now - XR_STATE["t"] < 0.6) and XR_STATE["targets"]
+                            tgt = list(XR_STATE["targets"]) if fresh else None
+                        if tgt:
+                            self.send(tgt)
+                elif mode == "mimic":
                     if now - self.last_send >= 1.0 / 25:
                         self.last_send = now
                         tgt = [int(round(self.smooth[fg] * FIST[i]))
@@ -364,6 +382,12 @@ class Engine(threading.Thread):
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
+try:
+    from flask_sock import Sock
+    sock = Sock(app)
+except Exception:                      # 没装 flask-sock 时退化为无 VR 模式
+    sock = None
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -384,11 +408,42 @@ def stream():
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.route("/xr")
+def xr_page():
+    return render_template("xr.html")
+
+
+if sock:
+    @sock.route("/ws/xr")
+    def ws_xr(ws):
+        """收头显推上来的 25 个手部关节，重定向成 13 个电机目标。"""
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            try:
+                d = json.loads(msg)
+                joints = d.get("hand")
+                if not joints or len(joints) != 25:
+                    continue
+                if RETARGET is None:
+                    continue
+                tgt, ratios = RETARGET.update(joints)
+                with XR_LOCK:
+                    XR_STATE["t"] = time.time()
+                    XR_STATE["targets"] = tgt
+                    XR_STATE["ratios"] = ratios
+            except Exception:
+                continue
+
+
 @app.route("/api/status")
 def api_status():
     with LOCK:
         s = {k: v for k, v in STATE.items() if k != "jpeg"}
     s["ratios"] = {FINGER_CN.get(k, k): round(v, 2) for k, v in s["ratios"].items()}
+    s["vr"] = {"age": round(time.time() - XR_STATE["t"], 2) if XR_STATE["t"] else None,
+               "ratios": {k: round(v, 2) for k, v in XR_STATE["ratios"].items()}}
     return jsonify(s)
 
 
@@ -404,7 +459,7 @@ def api_quick():
 def api_start():
     data = request.get_json(silent=True) or {}
     mode = data.get("mode", "mimic")
-    if mode not in ("mimic", "rps", "preview"):
+    if mode not in ("mimic", "rps", "preview", "vr"):
         return jsonify({"ok": False, "error": "mode?"}), 400
     if not ENG:
         return jsonify({"ok": False, "error": "engine not running"}), 503
@@ -454,8 +509,15 @@ def main():
     ENG = Engine(cam, landmarker)
     ENG.connect_hand()
     ENG.start()
-    print("控制台已启动： http://%s:%d" % (os.environ.get("DEXH13_HOST", "0.0.0.0"), PORT))
-    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False, use_reloader=False)
+    cert = os.environ.get("DEXH13_SSL_CERT")
+    key = os.environ.get("DEXH13_SSL_KEY")
+    if cert and key and os.path.exists(cert) and os.path.exists(key):
+        print("控制台已启动： https://0.0.0.0:%d  (VR 页面 /xr)" % PORT)
+        app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False,
+                use_reloader=False, ssl_context=(cert, key))
+    else:
+        print("控制台已启动： http://0.0.0.0:%d  (VR 需要 HTTPS，见 README)" % PORT)
+        app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False, use_reloader=False)
     return 0
 
 
