@@ -58,7 +58,7 @@ STATE = {
     "hand": False, "gesture": None, "ratios": {}, "spans": {},
     "fps": 0.0, "active": False, "mode": "preview",
     "score": {"me": 0, "bot": 0, "draw": 0},
-    "last": "", "jpeg": None, "jpeg_id": 0, "hand_ok": False, "message": "",
+    "last": "", "jpeg": None, "jpeg_id": 0, "lag_ms": 0, "proc_ms": 0, "cap_fps": 0.0, "hand_ok": False, "message": "",
     "tactile": [], "current": [], "pending": None,
 }
 
@@ -160,6 +160,8 @@ class Camera:
         self.cap = self._open(self.fmt)
         self.frame = None
         self.ts = 0.0
+        self.last_cap = 0.0
+        self.cap_fps = 0.0
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -203,6 +205,11 @@ class Camera:
             with self.lock:
                 self.frame = f
                 self.ts = time.time()
+                if self.last_cap > 0:
+                    d = self.ts - self.last_cap
+                    if d > 0:
+                        self.cap_fps = 0.9 * self.cap_fps + 0.1 / d 
+                self.last_cap = self.ts
 
     def get(self):
         with self.lock:
@@ -395,6 +402,8 @@ class Engine(threading.Thread):
             now = time.time()
             dt = now - prev
             prev = now
+            _lag = (now - ts) * 1000.0          # 采集到现在多久（排队/驱动缓冲）
+            _t_proc = time.time()
             self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt if dt > 0 else 0)
 
             h, w = frame.shape[:2]
@@ -463,6 +472,8 @@ class Engine(threading.Thread):
                             self._do(lambda: self.hand.play(ROBOT_MOVE[robot], duration=0.9))
 
             # ---- 叠字 + 编码 ----
+            cv2.putText(frame, datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             color = (0, 255, 0) if active else (160, 160, 160)
             cv2.putText(frame, "MODE: %s" % mode, (10, h - 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -477,6 +488,8 @@ class Engine(threading.Thread):
                 with LOCK:
                     STATE["jpeg"] = jpg.tobytes()
                 STATE["jpeg_id"] += 1
+                STATE["lag_ms"] = round(_lag)
+                STATE["proc_ms"] = round((time.time() - _t_proc) * 1000)
 
 
 # ---------------- Flask ----------------
@@ -645,7 +658,9 @@ def api_grasp():
         g = ForceGrasp(ENG.hand,
                        delta=int(d.get("delta", 150)),
                        step=int(d.get("step", 80)),
-                       hold=float(d.get("hold", 1.2)))
+                       hold=float(d.get("hold", 1.2)),
+                       use_tactile=bool(d.get("tactile", True)),
+                       tac_delta=int(d.get("tac_delta", 800)))
         ENG.grasp = g
         try:
             if not ENG.enabled:
