@@ -242,18 +242,38 @@ class Engine(threading.Thread):
 
     # --- 灵巧手 ---
     def connect_hand(self):
-        try:
-            h = DexH13(port=os.environ.get("DEXH13_PORT") or None)
-            h.connect()
-            self.hand = h
-            with LOCK:
-                STATE["hand_ok"] = True
-                STATE["message"] = "灵巧手已连接 " + h.version()
-        except Exception as e:
-            self.hand = None
-            with LOCK:
-                STATE["hand_ok"] = False
-                STATE["message"] = "灵巧手未连接：%s" % e
+        """优先用官方 SDK（固件 2.x 只有它给得出全量触觉），失败再退回 Modbus。"""
+        backend = os.environ.get("DEXH13_BACKEND", "auto")
+        errs = []
+        if backend in ("auto", "sdk"):
+            try:
+                from dexh13.sdk_hand import SDKHand
+                h = SDKHand(port=os.environ.get("DEXH13_PORT") or "/dev/ttyUSB0")
+                h.connect()
+                self.hand = h
+                self.backend = "sdk"
+                with LOCK:
+                    STATE["hand_ok"] = True
+                    STATE["message"] = "灵巧手已连接（SDK）" + h.version()
+                return
+            except Exception as e:
+                errs.append("SDK: %s" % e)
+        if backend in ("auto", "modbus"):
+            try:
+                h = DexH13(port=os.environ.get("DEXH13_PORT") or None)
+                h.connect()
+                self.hand = h
+                self.backend = "modbus"
+                with LOCK:
+                    STATE["hand_ok"] = True
+                    STATE["message"] = "灵巧手已连接（Modbus）" + h.version()
+                return
+            except Exception as e:
+                errs.append("Modbus: %s" % e)
+        self.hand = None
+        with LOCK:
+            STATE["hand_ok"] = False
+            STATE["message"] = "灵巧手未连接：" + "；".join(errs)
 
     def _do(self, fn):
         def run():
@@ -687,6 +707,7 @@ def api_status():
         s = {k: v for k, v in STATE.items() if k != "jpeg"}
     s["ratios"] = {FINGER_CN.get(k, k): round(v, 2) for k, v in s["ratios"].items()}
     now = time.time()
+    s["backend"] = getattr(ENG, "backend", "") if ENG else ""
     s["rec"] = {"on": REC["on"], "n": REC["n"], "dir": REC["dir"]}
     s["grasp"] = {"on": bool(ENG and ENG.grasp), "trace": (ENG.grasp_trace[-60:] if ENG else [])}
     s["vr"] = {"age": round(now - XR_STATE["t"], 2) if XR_STATE["t"] else None,

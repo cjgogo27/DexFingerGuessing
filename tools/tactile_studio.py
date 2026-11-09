@@ -25,6 +25,7 @@ except ImportError:
     Flask = None
 
 from pxdex.dh13 import DexH13Control
+from pxdex.dh13 import ControlMode
 
 N_POINTS = 1140
 AXIS = ("x", "y", "z")
@@ -120,6 +121,26 @@ if app:
         r = Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
         r.headers["Cache-Control"] = "no-store"
         return r
+
+
+    @app.route("/api/hand/<action>", methods=["POST"])
+    def hand_action(action):
+        """握拳 / 张开，用来制造触觉刺激。"""
+        val = {"close": 0.9, "half": 0.5, "open": 0.0}.get(action)
+        if val is None:
+            return jsonify({"ok": False, "error": "action?"}), 400
+        try:
+            if not HAND.isMotorEnabled():
+                HAND.enableMotor()
+                time.sleep(1.5)
+            try:
+                HAND.setMotorControlMode(ControlMode.POSITION_CONTROL_MODE)
+            except Exception:
+                pass
+            HAND.setJointPositionsRadian([val] * 16)
+            return jsonify({"ok": True, "rad": val})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.route("/api/status")
     def api_status():
