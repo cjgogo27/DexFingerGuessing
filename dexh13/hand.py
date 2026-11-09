@@ -36,12 +36,29 @@ class DexH13:
                     "没扫到灵巧手。检查：电源是否上电、RS485 的 A/B 是否接反、"
                     "串口是否被上位机占用。")
             self.port, self.baud, self.addr, _ = found[0]
-        self.tp = Transport(self.port, self.baud, self.addr, self.timeout).open()
-        ver = self.version()
-        if not ver:
-            self.tp.close()
-            raise RuntimeError("%s@%d 无有效版本号，可能不是灵巧手" % (self.port, self.baud))
-        return self
+        # 固件 1.x 走 460800，2.x 走 4000000。两个都试，谁先回话用谁。
+        candidates = [self.baud, 4000000, 460800, 1000000]
+        seen = set()
+        last_err = None
+        for baud in candidates:
+            if baud in seen:
+                continue
+            seen.add(baud)
+            try:
+                tp = Transport(self.port, baud, self.addr, self.timeout).open()
+            except Exception as e:
+                last_err = e
+                continue
+            self.tp, self.baud = tp, baud
+            try:
+                ver = self.version()
+            except Exception as e:
+                last_err, ver = e, None
+            if ver:
+                return self
+            tp.close()
+        raise RuntimeError("%s 无有效版本号（试过 %s）：%s"
+                           % (self.port, sorted(seen), last_err))
 
     def close(self):
         if self.tp:
