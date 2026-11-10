@@ -1,109 +1,186 @@
 # DexFingerGuessing
 
-**灵巧手的「猜拳」与「模仿」。** 抛个手势，让它接住。
+**Rock-paper-scissors and imitation for a dexterous hand.** Throw a gesture, let it catch you.
 
 <p align="center">
-  <a href="http://10.16.10.28:8000">
-    <img alt="打开网页控制台" src="https://img.shields.io/badge/%E2%96%B6%20%E6%89%93%E5%BC%80%E7%BD%91%E9%A1%B5%E6%8E%A7%E5%88%B6%E5%8F%B0-10.16.10.28%3A8000-1f6feb?style=for-the-badge">
+  <a href="http://10.16.10.28:8443">
+    <img alt="Open the web console" src="https://img.shields.io/badge/%E2%96%B6%20OPEN%20CONSOLE-10.16.10.28%3A8443-1f6feb?style=for-the-badge">
   </a>
 </p>
 
-> **▶ 打开网页控制台** 指向实验室内网 `http://10.16.10.28:8000`，外网打不开。
-> 自己部署时改成 `http://<你的IP>:8000` 即可。
+> The console link above points at the lab LAN (`https://10.16.10.28:8443`) and is not reachable
+> from the internet. When deploying your own copy, replace it with `https://<your-ip>:8443`.
 
-帕西尼 **DexH13** 灵巧手的 Python 驱动层 + 两个互动玩法 + 网页控制台。
-不依赖官方 SDK（官方仅 Linux 且要求固件 2.0+），**本机固件 1.4.4 可直接跑**。
+A Python driver layer for the PaXini **DexH13** dexterous hand, plus two interactive games,
+a browser console, VR teleoperation, a teleop data recorder and a force-controlled grasp.
 
-<p align="center"><img src="docs/img/hand-tracking.jpg" width="620" alt="实时手部关键点"></p>
+Works with two backends:
 
-## 硬件
+| Firmware | Backend | Notes |
+|---|---|---|
+| **1.4.x** | our own Modbus RTU driver | reverse engineered, no vendor library needed |
+| **2.0.2+** | official `pxdex` SDK | required for the full tactile array |
 
-| 部件 | 规格 |
+<p align="center"><img src="docs/img/hand-tracking.jpg" width="620" alt="Live hand landmarks"></p>
+
+## Hardware
+
+| Part | Spec |
 |---|---|
-| 灵巧手 | PaXini DexH13 右手，固件 `V1.4.4_D`，从站 `0x79` |
-| 供电 | 24–48 V DC，3 A Max |
-| 通信 | RS485 / Modbus RTU，**460800** 8N1 |
-| USB-485 | Prolific **PL2303GR**（CH340 不行，上限 3 Mbps） |
-| 摄像头 | 任意 UVC，720p 即可 |
+| Hand | PaXini DexH13, right hand, slave `0x79` (left `0x78`) |
+| Power | 24–48 V DC, 3 A max |
+| Link | RS485 / Modbus RTU, 8N1 |
+| Baud | **460800** on firmware 1.x, **4 000 000** on firmware 2.x |
+| USB-RS485 | Prolific **PL2303GR** — CH340 tops out at 3 Mbaud and will not work |
+| Camera | any UVC camera, 720p is enough |
 
-接线：`绿→A  白→B  黑→GND  屏蔽→悬空`。
-接线图、供电安全、排障见 [docs/HARDWARE.md](docs/HARDWARE.md)。
+Wiring: `green -> A`, `white -> B`, `black -> GND`, shield floating.
+Diagrams, power safety and troubleshooting live in [docs/HARDWARE.md](docs/HARDWARE.md).
 
-## 快速开始
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-bash scripts/fetch_model.sh      # 下载 7.8 MB 手部关键点模型
-python3 scripts/check_env.py     # 自检：依赖 / 模型 / 串口 / 摄像头
-python3 web/app.py               # 打开 http://<本机IP>:8000
+bash scripts/fetch_model.sh      # downloads the 7.8 MB hand landmark model
+python3 scripts/check_env.py     # checks deps / model / serial / camera
+python3 web/app.py               # then open https://<host>:8000
 ```
 
-`check_env.py` 会逐项打勾，缺什么一目了然。没有硬件也能玩摄像头部分。
+`check_env.py` ticks every item off one by one, so a missing piece is obvious.
+The camera-only parts work with no hardware attached.
 
-## 玩法
+## What you can do
 
-**网页控制台**（推荐）：实时画面 + 骨架，手摆好再点开始。
+**Web console** — live MJPEG feed with the 21-point hand skeleton, plus controls.
 
-| 模式 | 说明 |
+| Mode | Behaviour |
 |---|---|
-| 预览 | 只看不动 |
-| 跟随模仿 | 你的手指怎么弯，手就怎么弯 |
-| 猜拳 | 识别石头/剪刀/布，手跟你对局 |
+| Preview | look, do not move |
+| Mimic | your fingers bend, the hand bends |
+| RPS | recognises rock / paper / scissors and plays against you |
+| **VR** | PICO / Quest hand tracking drives the hand (see below) |
 
-页面里还带一个**手势挑战**小游戏：30 秒内按提示比出手势，纯前端，不需要灵巧手。
+The console also has a **gesture challenge** minigame (pure front end, no hand needed)
+and a **return to zero** button that stops the current mode and homes all 13 joints.
 
-控制面板另有 **复位到零位**：停掉当前玩法、13 个关节回零、并保持使能，
-随时可以一键把手收回初始姿态。
-
-**命令行**：
+**Command line**:
 
 ```bash
-python3 games/rps.py --rounds 5        # 猜拳
-python3 games/mimic.py --seconds 30    # 跟随模仿
-python3 lessons/l1_probe.py            # 从这开始：先把手的身份扫出来
+python3 games/rps.py --rounds 5        # rock-paper-scissors
+python3 games/mimic.py --seconds 30    # imitation
+python3 lessons/l1_probe.py            # start here: identify the hand
 ```
 
-六节课 `lessons/l1..l6` 从扫描、读数、使能一路到采数据，建议按顺序读一遍。
+Six lessons under `lessons/l1..l6` walk from scanning and reading registers to enabling the
+motors and recording data.
 
-## 目录
+## VR teleoperation
+
+The headset opens `/xr` in its browser and streams WebXR hand joints over a WebSocket;
+the server retargets 25 joints down to the hand's 13 degrees of freedom.
+
+```bash
+# WebXR needs a secure context, so serve over TLS
+export DEXH13_SSL_CERT=certs/cert.pem DEXH13_SSL_KEY=certs/key.pem
+export DEXH13_WEB_PORT=8443
+python3 web/app.py
+```
+
+On PICO the interaction mode must be **"controllers and hands switch automatically"**;
+"controllers only" hides the hand input source entirely. When no hand data arrives the page
+falls back to the controller trigger as a grip value, so the link can be tested before the
+hand tracking is sorted out.
+
+* (EN) `xr.html` requests an `XRWebGLLayer` and clears it every frame. Without that the
+  compositor never receives a frame and the headset shows its loading spinner forever.
+
+## Recording and force grasp
+
+Two extra buttons in the console:
+
+- **Start recording** writes `records/<timestamp>/trace.csv` at 30 Hz with the commanded
+  targets, the measured joint positions, the motor currents and the retargeting ratios.
+- **Force grasp** closes the fingers step by step and freezes a finger on the first contact
+  signal — a tactile spike, a position stall, or a current rise. Three layers, in that order,
+  so the hand stops as soon as it touches something instead of crushing it.
+
+See [docs/DATA.md](docs/DATA.md) for the CSV layout and the tuning knobs.
+
+## Tactile
+
+Firmware 1.x exposes only a handful of tactile channels over Modbus (about 7 usable values,
+3.9 Hz), which is why the full array used to be out of reach.
+
+After upgrading the mainboard to **2.0.2** the official SDK returns the whole thing:
 
 ```
-dexh13/     驱动（crc / protocol / transport / hand / gestures）
-games/      rps.py 猜拳 · mimic.py 跟随模仿
-web/        app.py + templates/index.html（Flask + MJPEG）
-lessons/    l1_probe → l6_record
-docs/       PROTOCOL.md（协议逆向）· HARDWARE.md（接线/供电/排障）
-scripts/    fetch_model.sh · check_env.py
+getAllTactileData()  ->  11 sensors, 1140 points (3 axes each), 11 temperatures
+                         ~15 ms per call,  ~65 Hz
 ```
 
-## 协议要点
+`tools/tactile_studio.py` renders those 1140 points as a strip image and serves it over MJPEG —
+that is exactly the `1140 x T` representation used by tactile-compression work.
 
-标准 Modbus RTU（FC03 / FC16，CRC 低字节在前），寄存器表与实测帧样例见
-[docs/PROTOCOL.md](docs/PROTOCOL.md)。三个容易踩的坑：
+```bash
+python3 tools/tactile_studio.py          # http://<host>:8666
+curl -X POST http://<host>:8666/api/record/start
+curl -X POST http://<host>:8666/api/record/stop   # -> records/tactile_*.npz (T,1140,3)
+```
 
-1. 位置和电流是 **int16 有符号**，按无符号读会把 `-17` 读成 `65519`
-2. `0x2010` / `0x2020` 是只写寄存器，读回来恒为 `0xFFFF`
-3. 使能必须五步时序，少一步关节不动
+> Only one process can own the serial port, so the console and the tactile studio cannot
+> run at the same time. Pick one.
 
-## 已知限制
+## Firmware notes
 
-- **触觉读不到**：460800 仅约 46 KB/s，全量触觉需 547 KB/s，要升固件到 2.0+ 或走 EtherCAT
-- **只有 4 指**：拇指 + 食/中/无名，模仿时小指不参与
-- **没有力控**：力控在官方 SDK 里（需固件 2.0+）
-- **单目**：无深度、无标定，换机位需重新标定
+Upgrading the mainboard changes the wire protocol underneath you:
 
-## 免责声明
+- the hand leaves 460800 and settles at **4 000 000** baud
+- the reverse-engineered Modbus registers stop answering
+- the SDK becomes the only way to read the full tactile array
 
-非官方项目。协议由逆向 `pxdex-h13` 上位机得到，仅用于互操作与研究；
-相关商标与著作权归帕西尼（PaXini）所有。
+The driver probes several baud rates and picks the first one that returns a version string, and
+the engine tries the SDK first and falls back to Modbus, so both firmware generations work
+without editing code. Force the backend with `DEXH13_BACKEND=sdk|modbus`.
 
+## Layout
 
-## 数据与力控
+```
+dexh13/     driver (crc / protocol / transport / hand / gestures / sdk_hand / grasp)
+games/      rps.py · mimic.py
+web/        app.py + templates/{index,xr}.html  (Flask + MJPEG + WebSocket)
+tools/      tactile_studio.py (full 1140-point tactile image)
+lessons/    l1_probe -> l6_record
+docs/       PROTOCOL.md · HARDWARE.md · DATA.md
+scripts/    fetch_model.sh · check_env.py · recover_camera.sh
+```
 
-- **遥操作数据采集**：控制台点「开始录制」，落 `records/<时间戳>/trace.csv`（30 Hz，含目标/实测位置/电流/比值）
-- **力控抓握**：点「力控抓握」，逐级合拢，电流或位置停滞即冻结，用来捏住但不捏碎
+## Protocol notes
 
-详见 [docs/DATA.md](docs/DATA.md)。
+Standard Modbus RTU (FC03 / FC16, CRC low byte first). The register map and captured frames are
+in [docs/PROTOCOL.md](docs/PROTOCOL.md). Three things that bite:
+
+1. positions and currents are **signed int16** — reading them unsigned turns `-17` into `65519`
+2. `0x2010` / `0x2020` are write-only and always read back as `0xFFFF`
+3. enabling needs a five-step sequence; skip one and the joints simply do not move
+
+On the SDK side: `joint1` (abduction) rejects non-zero values on this hand, so it is held at 0
+and the motors map onto `joint2..4`; `getFingerTactile()` returns all zeros on 2.0.2 and the
+full array has to come from `getAllTactileData()`.
+
+## Known limitations
+
+- **Four fingers** — thumb plus index/middle/ring, the pinky does not exist
+- **No force control on firmware 1.x** — it lives in the 2.0 SDK
+- **Monocular camera** — no depth, no calibration; moving the camera means recalibrating
+- **One serial owner** — console, tactile studio and CLI scripts take turns
+
+## Disclaimer
+
+Unofficial project. The 1.x protocol was obtained by reverse engineering the `pxdex-h13` host
+application, for interoperability and research only. Trademarks and copyrights belong to
+PaXini.
+
 ## License
 
-MIT（仅本项目代码）。依赖：MediaPipe / OpenCV（Apache-2.0）、pyserial（BSD）、Flask（BSD）。
+MIT for the code in this repository.
+Dependencies: MediaPipe / OpenCV (Apache-2.0), pyserial (BSD), Flask (BSD).
